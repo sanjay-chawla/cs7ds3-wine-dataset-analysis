@@ -1,0 +1,182 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+Importing libraries
+```{r}
+library(ggplot2)
+library(dplyr)
+library(MCMCpack)
+```
+
+Read input and remove NA values
+
+```{r}
+data_all<-read.csv('winemag-data-130k-v2.csv')
+data<-droplevels(na.omit(data_all))
+```
+
+Plotting *points* histogram
+```{rcollapse=TRUE}
+ggplot(data, aes(x=points)) + geom_histogram(aes(y=..density..),
+                   binwidth=1,alpha=.5, position="dodge"
+                   ) +
+    geom_density(adjust = 5)
+  
+```
+Filtering and grouping data
+```{r}
+data_cons <- data %>% 
+  dplyr::filter(((country=='South Africa' & variety=='Sauvignon Blanc')|(country=='Chile' & variety=='Chardonnay')) & (price==15)) %>%
+  dplyr::select(variety, points) %>%
+  group_by(variety) %>% 
+  dplyr::mutate(points.mean=mean(points), points.variance=var(points))
+```
+Comparing the two categories
+```{r collapse=TRUE}
+ggplot(data_cons) + geom_boxplot(aes(variety, points, fill = variety)) +
+geom_jitter(aes(variety,points, shape = variety))
+ggplot(data_cons, aes(color = variety, sample = rt(nrow(data_cons), df = 18)))  + geom_qq()
+  
+ggplot(data_cons, aes(x=points)) + geom_histogram(aes(y=..density..),
+                   binwidth=0.5,alpha=.5, position="dodge"
+                   )  +
+  geom_vline(data=data_cons, aes(xintercept=points.mean),
+               linetype="dashed", size=1) +
+    geom_density(alpha=.2) +
+  facet_grid(variety ~ .)  # Overlay with transparent density plot
+```
+Performing Welch T-test
+```{r collapse=TRUE}
+res <- t.test(points ~ variety, data=data_cons, alternative="less") # note absence of var.equal=TRUE
+res
+data_cons %>% group_by(variety) %>% summarise(n=n(), mean=mean(points), variance=var(points), min=min(points), max=max(points), sd=sd(points))
+#stats <- data_cons %>% group_by(variety) %>% summarize(mean = mean(points), variance=var(points))
+test <- function(){
+  ntotal <- nrow(data_cons)
+  nsamp <- 50 ## subset to sample
+  ind_samp <- sample(1:ntotal, nsamp, replace = TRUE) ## which datapoints to sample
+  df_samp <- data_cons[ind_samp, ] ## which datapoints to sample
+  df_samp <- droplevels(df_samp)
+  return(t.test(points ~ variety, data=df_samp))
+}
+test_samples <- replicate(500,test()$statistic)
+#range(test_samples)[1]
+pts = seq(-8,8,length=500)
+x <- plot(density(test_samples),col='red',type='l', main = "Welch T density")
+abline(v = res$statistic)
+text(c(-2, res$statistic-0.15), c(0.2, 0.15), labels = c("", res$statistic), srt=90)
+#lines(density(test_samples))
+#qqplot(test_samples,rt(1000,df=18))
+#abline(0,1)
+```
+Define prior values and gibbs function
+```{r collapse=TRUE}
+qnorm(c(0.025, 0.975), 85, 10)
+compare_2_gibbs <- function(y, ind, mu0 = 85, tau0 = 1/49, del0 = 1, gamma0 = 1/16, a0 = 50, b0 = 150, maxiter = 5000) {
+  y1 <- y[ind == 'Sauvignon Blanc']
+  y2 <- y[ind == 'Chardonnay']
+  n1 <- length(y1)
+  n2 <- length(y2)
+  ##### starting values
+  mu <- (mean(y1) + mean(y2)) / 2
+  del <- (mean(y1) - mean(y2)) / 2
+  mat_store <- matrix(0, nrow = maxiter, ncol = 3)
+  #####
+  ##### Gibbs sampler
+  an <- a0 + (n1 + n2)/2
+  for(s in 1 : maxiter) {
+    ##update tau
+    bn <- b0 + 0.5 * (sum((y1 - mu - del) ^ 2) + sum((y2 - mu + del) ^ 2))
+    tau <- rgamma(1, an, bn)
+    ##
+    ##update mu
+    taun <- tau0 + tau * (n1 + n2)
+    mun <- (tau0 * mu0 + tau * (sum(y1 - del) + sum(y2 + del))) / taun
+    mu <- rnorm(1, mun, sqrt(1/taun))
+    ##
+    ##update del
+    gamman <- gamma0 + tau*(n1 + n2)
+    deln <- ( del0 * tau0 + tau * (sum(y1 - mu) - sum(y2 - mu))) / gamman
+    del<-rnorm(1, deln, sqrt(1/gamman))
+    ##
+    ## store parameter values
+    mat_store[s, ] <- c(mu, del, tau)
+  }
+  colnames(mat_store) <- c("mu", "del", "tau")
+  return(mat_store)
+}
+```
+Perform Gibbs sampling on data. Plot MCMC stats.
+
+
+```{r}
+fit <- compare_2_gibbs(data_cons$points, as.factor(data_cons$variety))
+plot(as.mcmc(fit))
+acf(fit)
+raftery.diag(fit)
+
+```
+Some more plots...
+```{r collapse=TRUE}
+par(mfrow = c(2, 2))
+plot(density(fit[, 1]), main = "Posterior for mean of difference",
+xlab = expression(mu))
+plot(density(fit[, 2]), main = "Posterior for precision of difference",
+xlab = expression(tau))
+plot(density(1/sqrt(fit[, 2]), na.rm=T), main = "Posterior for sd of difference",
+xlab = expression(sigma))
+plot(fit[, 1], 1/sqrt(fit[, 2]),
+main = "Joint posterior for mean and sd of difference",
+xlab = expression(mu), ylab = expression(sigma))
+```
+Numeric values for mu, del and tau
+```{r collapse=TRUE}
+apply(fit, 2, mean)
+apply(fit, 2, sd)
+mean(1/sqrt(fit[, 3]))
+sd(1/sqrt(fit[, 3]))
+```
+Generate random samples and plot difference histogram
+```{r collapse=TRUE}
+y1_sim <- rnorm(5000, fit[, 1] + fit[, 2], sd = 1/sqrt(fit[, 3]))
+y2_sim <- rnorm(5000, fit[, 1] - fit[, 2], sd = 1/sqrt(fit[, 3]))
+ggplot(data.frame(y_sim_diff = y1_sim - y2_sim)) + stat_bin(aes(y_sim_diff), binwidth = 1, alpha = 0.7)
+```
+Calculate probability of difference of mean
+```{r}
+mean(y1_sim > y2_sim)
+ggplot(data.frame(y1_sim, y2_sim)) + geom_point(aes(y1_sim, y2_sim), alpha = 0.3) +
+geom_abline(slope = 1, intercept = 0)
+```
+```{r}
+a0 <- 1
+b0 <- 100
+tau_range <- qgamma( c(0.005, 0.995), a0, rate = b0)
+## N.B., you can define dgamma in terms of scale or rate parameter
+## make sure you specify correctly!
+xseq <- seq(tau_range[1], tau_range[2], length.out = 100)
+y <- dgamma(xseq, a0, b0)
+ggplot(data.frame(xseq, y)) + geom_line(aes(xseq, y)) #+ geom_vline(xintercept = 0.0688)
+#xlab = expression(tau), main = "Prior for precision parameter")
+#abline(v = 0.01, col = 2, lty = 2, lwd = 2) ## true value of tau'
+
+
+mu <- 5
+a_n <- 45.5
+b_n <- 205
+
+tau_range <- qgamma( c(0.005, 0.995), a_n, rate = b_n)
+xseq <- seq(tau_range[1], tau_range[2], length.out = 1000)
+plot(xseq, dgamma(xseq, a_n, rate = b_n), type="l", xlab = expression(tau),
+main = "Posterior for precision parameter")
+abline(v = 0.01, col = 2, lty = 2, lwd = 2) ## true value of tau
+
+## prior density plot for standard deviation sigma
+tau_post_samp <- rgamma(1000, a_n, rate = b_n)
+hist(1/sqrt(tau_post_samp), main = "Posterior for standard deviation",
+xlab = expression(sigma), freq = FALSE)
+lines(density(1/sqrt(tau_post_samp)))
+abline(v = 10, col = 2, lty = 2, lwd = 2) ## true value of sd
+```
+
